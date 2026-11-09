@@ -5,5 +5,6 @@
 
 void *halloc(size_t n);
 void hfree(void *p);
+void hshow();
 
 #endif
