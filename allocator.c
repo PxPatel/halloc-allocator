@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include "allocator.h"
 #include <unistd.h>
+#include <errno.h>
 
 // Constants and macros
 #define WSIZE 4
@@ -30,9 +31,28 @@ static void *heap_listp;
 static void *mem_cursorp;
 static void *epilogue_blockp;
 
-static size_t block_padding(size_t words)
+static bool add_checked(size_t a, size_t b, size_t *out)
 {
-    return (words % ALIGNMENT ? ALIGNMENT - (words % ALIGNMENT) : 0);
+    if (__builtin_add_overflow(a, b, out))
+    {
+        errno = ENOMEM;
+        return false;
+    }
+    return true;
+}
+static bool mult_checked(size_t a, size_t b, size_t *out)
+{
+    if (__builtin_mul_overflow(a, b, out))
+    {
+        errno = ENOMEM;
+        return false;
+    }
+    return true;
+}
+
+static size_t block_padding(size_t bytes)
+{
+    return (bytes % ALIGNMENT ? ALIGNMENT - (bytes % ALIGNMENT) : 0);
 }
 
 static void *coalesce(void *bp)
@@ -50,9 +70,17 @@ static void *coalesce(void *bp)
                        (next_block_free ? GET_SIZE(next_block_hdr) : 0);
     unsigned int new_header = PACK(new_total, 0);
 
-    PUT(prev_block_free ? prev_block_hdr : HDRP(bp), new_header);
-    PUT(next_block_free ? FTRP(next_block) : FTRP(bp), new_header);
+    void *curr_hdr = HDRP(bp);
+    void *curr_ftr = FTRP(bp);
 
+    PUT(prev_block_free ? prev_block_hdr : curr_hdr, new_header);
+    PUT(next_block_free ? FTRP(next_block) : curr_ftr, new_header);
+
+    if (mem_cursorp >= (prev_block_free ? prev_block : bp) && mem_cursorp <= (next_block_free ? FTRP(next_block) : next_block))
+    {
+        mem_cursorp = next_block_free ? bp : mem_cursorp;
+        mem_cursorp = prev_block_free ? prev_block : mem_cursorp;
+    }
     return prev_block_free ? prev_block : bp;
 }
 
@@ -61,7 +89,8 @@ static void *mem_extend_heap(size_t words)
     void *bp;
     size_t size;
 
-    size = WSIZE * (words + block_padding(words));
+    size_t bytes = WSIZE * words;
+    size = bytes + block_padding(bytes);
     if ((long)(bp = sbrk(size)) == -1)
     {
         return NULL;
@@ -159,28 +188,178 @@ void *halloc(size_t n)
     }
 
     // Block size = payload + header + footer + padding
-    size_t r_size = n + DSIZE + block_padding(n + DSIZE);
+    size_t unaligned_size;
+    if (!add_checked(n, DSIZE, &unaligned_size))
+        return NULL;
+
+    size_t r_size;
+    if (!add_checked(unaligned_size, block_padding(unaligned_size), &r_size))
+        return NULL;
 
     void *blockp;
     if ((blockp = placement(r_size)) == NULL)
     {
-        unsigned int multipler = (r_size / CHUNKSIZE) + (r_size % CHUNKSIZE ? 1 : 0);
-        if ((blockp = mem_extend_heap(CHUNKSIZE * multipler / WSIZE)) == NULL)
+        size_t multipler;
+        if (!add_checked((r_size / CHUNKSIZE), (r_size % CHUNKSIZE ? 1 : 0), &multipler))
+            return NULL;
+
+        size_t extension_size;
+        if (!mult_checked(CHUNKSIZE, multipler, &extension_size))
+            return NULL;
+
+        if ((blockp = mem_extend_heap(extension_size / WSIZE)) == NULL)
         {
             return NULL;
         }
     }
 
     void *bp = split(blockp, r_size);
+    mem_cursorp = NEXT_BLOCK(bp);
     return bp;
 }
 
 void hfree(void *p)
 {
-    size_t size = GET_SIZE(HDRP(p));
+    if (p == NULL)
+    {
+        return;
+    }
+
+    if (p < heap_listp || p >= epilogue_blockp)
+    {
+        return;
+    }
+
+    if ((size_t)p % 8 != 0)
+    {
+        return;
+    }
+
+    void *hdr = HDRP(p);
+    if (!GET_ALLOC(hdr))
+    {
+        return;
+    }
+
+    if (*(int *)hdr != *(int *)(FTRP(p)))
+    {
+        return;
+    }
+
+    size_t p_size = GET_SIZE(hdr);
+    if (p_size <= 0 || ((char *)FTRP(p) + WSIZE > (char *)epilogue_blockp))
+    {
+        return;
+    }
+
+    size_t size = p_size;
     PUT(HDRP(p), PACK(size, 0));
     PUT(FTRP(p), PACK(size, 0));
     coalesce(p);
+}
+
+void *hcalloc(size_t n)
+{
+    void *bp = halloc(n);
+    if (bp == NULL)
+    {
+        return NULL;
+    }
+
+    size_t bp_size = GET_SIZE(HDRP(bp));
+    int num_bytes = (bp_size - DSIZE) / WSIZE;
+    for (int i = 0; i < num_bytes; i++)
+    {
+        ((int *)bp)[i] = 0;
+    }
+    return bp;
+}
+
+void *hrealloc(void *p, size_t n)
+{
+    if (p == NULL)
+    {
+        return halloc(n);
+    }
+
+    if (n == 0)
+    {
+        hfree(p);
+        return NULL;
+    }
+
+    void *bp_hdr = HDRP(p);
+    void *next_block_hdr = HDRP(NEXT_BLOCK(p));
+    bool is_next_block_epilogue = GET_SIZE(next_block_hdr) == 0 && GET_ALLOC(next_block_hdr);
+
+    size_t curr_size = GET_SIZE(bp_hdr);
+    size_t unaligned_size;
+    if (!add_checked(n, DSIZE, &unaligned_size))
+        return NULL;
+
+    size_t r_size;
+    if (!add_checked(unaligned_size, block_padding(unaligned_size), &r_size))
+        return NULL;
+    signed long additional_needed = r_size - curr_size;
+
+    if (additional_needed == 0)
+    {
+        return p;
+    }
+
+    // Space within current (if r_size is smaller) or forward block
+    if (r_size < curr_size || (!is_next_block_epilogue && !GET_ALLOC(next_block_hdr) && (signed long)(GET_SIZE(next_block_hdr)) >= additional_needed))
+    {
+
+        PUT(bp_hdr, PACK(curr_size + (additional_needed > 0 ? GET_SIZE(next_block_hdr) : 0), 1));
+        void *res_blockp = split(p, r_size);
+
+        if (!(r_size < curr_size) && mem_cursorp == ((char *)next_block_hdr + WSIZE))
+        {
+            mem_cursorp = res_blockp;
+        }
+
+        if (additional_needed < 0)
+        {
+            coalesce(NEXT_BLOCK(res_blockp));
+        }
+        return res_blockp;
+    }
+    else
+    {
+        // Find a free block or extend heap space
+        void *new_blockp;
+        if ((new_blockp = placement(r_size)) == NULL)
+        {
+            size_t multipler;
+            if (!add_checked((r_size / CHUNKSIZE), (r_size % CHUNKSIZE ? 1 : 0), &multipler))
+                return NULL;
+
+            size_t extension_size;
+            if (!mult_checked(CHUNKSIZE, multipler, &extension_size))
+                return NULL;
+
+            if ((new_blockp = mem_extend_heap(extension_size / WSIZE)) == NULL)
+            {
+                return NULL;
+            }
+        }
+
+        // Split new chunk
+        void *res_blockp = split(new_blockp, r_size);
+
+        // Copy data into new block
+        int num_bytes = (curr_size - DSIZE) / WSIZE;
+        for (int i = 0; i < num_bytes; i++)
+        {
+            ((int *)res_blockp)[i] = ((int *)p)[i];
+        }
+
+        // Free old block
+        hfree(p);
+
+        return res_blockp;
+    }
 }
 
 void hshow()
